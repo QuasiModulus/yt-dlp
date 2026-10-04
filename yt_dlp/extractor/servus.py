@@ -1,14 +1,13 @@
 from .common import InfoExtractor
+from ..networking.exceptions import HTTPError
 from ..utils import (
     ExtractorError,
+    filter_dict,
     float_or_none,
-    format_field,
     int_or_none,
-    join_nonempty,
-    traverse_obj,
-    unescapeHTML,
     unified_timestamp,
 )
+from ..utils.traversal import traverse_obj
 
 
 class ServusIE(InfoExtractor):
@@ -17,7 +16,7 @@ class ServusIE(InfoExtractor):
                         (?:www\.)?
                         (?:
                             servus\.com/(?:(?:at|de)/p/[^/]+|tv/videos)|
-                            (?:servustv|pm-wissen)\.com/(?:[^/]+/)?v(?:ideos)?
+                            (?:servustv|pm-wissen)\.com/(?:[^/]+/)?(?:v(?:ideos)?|page|embed)
                         )
                         /(?P<id>[aA]{2}-?\w+|\d+-\d+)
                     '''
@@ -27,20 +26,27 @@ class ServusIE(InfoExtractor):
         'info_dict': {
             'id': 'AA-28BYCQNH92111',
             'ext': 'mp4',
-            'title': 'Vie Ferrate - Klettersteige in den Alpen',
-            'description': 'md5:25e47ddd83a009a0f9789ba18f2850ce',
+            'title': 'Klettersteige in den Alpen',
+            'description': 'md5:86d0c9eb3b2b6d7cdff247d1ba997ace',
             'thumbnail': r're:^https?://.*\.jpg',
-            'duration': 2823,
+            'duration': 2823.28,
             'timestamp': 1655752333,
             'upload_date': '20220620',
             'series': 'Bergwelten',
             'season': 'Season 11',
             'season_number': 11,
-            'episode': 'Episode 8 - Vie Ferrate – Klettersteige in den Alpen',
+            'episode': 'Episode 8',
             'episode_number': 8,
-            'categories': ['Bergwelten'],
+            'categories': ['Natur'],
         },
         'params': {'skip_download': 'm3u8'},
+    }, {
+        # URL schema v4
+        'url': 'https://www.servustv.com/de/page/AA-28BYCQNH92111/vie-ferrate-klettersteige-in-den-alpen',
+        'only_matching': True,
+    }, {
+        'url': 'https://www.servustv.com/de/embed/AA-28BYCQNH92111',
+        'only_matching': True,
     }, {
         'url': 'https://www.servustv.com/natur/v/aa-1xg5xwmgw2112/',
         'only_matching': True,
@@ -73,70 +79,47 @@ class ServusIE(InfoExtractor):
         video_id = self._match_id(url).upper()
 
         webpage = self._download_webpage(url, video_id)
-        next_data = self._search_nextjs_data(webpage, video_id, fatal=False)
+        nextjs_data = self._search_nextjs_v13_data(webpage, video_id, fatal=False)
+        session = traverse_obj(nextjs_data, (..., 'session', {dict}, any)) or {}
+        card = traverse_obj(nextjs_data, (
+            ..., 'featuredCollectionCards', lambda _, v: v['id'] == video_id, any)) or {}
 
-        video = self._download_json(
-            'https://api-player.redbull.com/stv/servus-tv-playnet',
-            video_id, 'Downloading video JSON', query={'videoId': video_id})
-        if not video.get('videoUrl'):
-            self._report_errors(video)
+        try:
+            video = self._download_json(
+                'https://play.redbull.com/init/v1/stv/{}/{}/{}/{}/{}'.format(
+                    session.get('locale') or 'de', session.get('country_code') or 'at',
+                    session.get('category') or 'personal_computer', session.get('os_family') or 'http',
+                    video_id),
+                video_id, 'Downloading video JSON', query=filter_dict({
+                    'device_group': session.get('device_group'),
+                }))
+        except ExtractorError as e:
+            if isinstance(e.cause, HTTPError) and e.cause.status == 404:
+                raise ExtractorError(
+                    e.cause.response.read().decode(errors='replace') or 'Video not found', expected=True)
+            raise
+
         formats, subtitles = self._extract_m3u8_formats_and_subtitles(
-            video['videoUrl'], video_id, 'mp4', m3u8_id='hls')
+            video['manifest_url'], video_id, 'mp4', m3u8_id='hls')
 
-        season = video.get('season')
-        season_number = int_or_none(self._search_regex(
-            r'Season (\d+)', season or '', 'season number', default=None))
-        episode = video.get('chapter')
-        episode_number = int_or_none(self._search_regex(
-            r'Episode (\d+)', episode or '', 'episode number', default=None))
+        season_number, episode_number = self._search_regex(
+            r'S(\d+)\s*E(\d+)', traverse_obj(card, (
+                'header_badges', lambda _, v: v['type'] == 'episode_info', 'value', {str}, any)) or '',
+            'episode info', group=(1, 2), default=(None, None))
 
         return {
+            **self._search_json_ld(webpage, video_id, expected_type='VideoObject', default={}),
             'id': video_id,
-            'title': video.get('title'),
-            'description': self._get_description(next_data) or video.get('description'),
-            'thumbnail': video.get('poster'),
-            'duration': float_or_none(video.get('duration')),
-            'timestamp': unified_timestamp(video.get('currentSunrise')),
-            'series': video.get('label'),
-            'season': season,
-            'season_number': season_number,
-            'episode': episode,
-            'episode_number': episode_number,
+            'season_number': int_or_none(season_number),
+            'episode_number': int_or_none(episode_number),
             'formats': formats,
             'subtitles': subtitles,
-            **traverse_obj(next_data, ('props', 'pageProps', 'data', {
-                'title': ('title', 'rendered', {str}),
-                'timestamp': ('stv_date', 'raw', {int}),
-                'duration': ('stv_duration', {float_or_none}),
-                'categories': ('category_names', ..., {str}),
-            })),
+            **traverse_obj(card, {
+                'title': ('title', {str}),
+                'description': (('long_description', 'short_description'), {str}, filter, any),
+                'duration': ('duration', {float_or_none(scale=1000)}),
+                'timestamp': ('start_time', {unified_timestamp}),
+                'series': ('show_name', {str}),
+                'categories': ('content_color', ..., {str}, filter, all, filter),
+            }),
         }
-
-    def _get_description(self, next_data):
-        return join_nonempty(*traverse_obj(next_data, (
-            'props', 'pageProps', 'data',
-            ('stv_short_description', 'stv_long_description'), {str},
-            {lambda x: x.replace('\n\n', '\n')}, {unescapeHTML})), delim='\n\n')
-
-    def _report_errors(self, video):
-        playability_errors = traverse_obj(video, ('playabilityErrors', ...))
-        if not playability_errors:
-            raise ExtractorError('No videoUrl and no information about errors')
-
-        elif 'FSK_BLOCKED' in playability_errors:
-            details = traverse_obj(video, ('playabilityErrorDetails', 'FSK_BLOCKED'), expected_type=dict)
-            message = format_field(''.join((
-                format_field(details, 'minEveningHour', ' from %02d:00'),
-                format_field(details, 'maxMorningHour', ' to %02d:00'),
-                format_field(details, 'minAge', ' (Minimum age %d)'),
-            )), None, 'Only available%s') or 'Blocked by FSK with unknown availability'
-
-        elif 'NOT_YET_AVAILABLE' in playability_errors:
-            message = format_field(
-                video, (('playabilityErrorDetails', 'NOT_YET_AVAILABLE', 'availableFrom'), 'currentSunrise'),
-                'Only available from %s') or 'Video not yet available with unknown availability'
-
-        else:
-            message = f'Video unavailable: {", ".join(playability_errors)}'
-
-        raise ExtractorError(message, expected=True)
