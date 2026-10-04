@@ -1,13 +1,10 @@
 from .common import InfoExtractor
-from ..networking.exceptions import HTTPError
 from ..utils import (
-    ExtractorError,
-    filter_dict,
     float_or_none,
     int_or_none,
+    traverse_obj,
     unified_timestamp,
 )
-from ..utils.traversal import traverse_obj
 
 
 class ServusIE(InfoExtractor):
@@ -16,7 +13,7 @@ class ServusIE(InfoExtractor):
                         (?:www\.)?
                         (?:
                             servus\.com/(?:(?:at|de)/p/[^/]+|tv/videos)|
-                            (?:servustv|pm-wissen)\.com/(?:[^/]+/)?(?:v(?:ideos)?|page|embed)
+                            (?:servustv|pm-wissen)\.com/(?:[^/]+/)?(?:v(?:ideos)?|page)
                         )
                         /(?P<id>[aA]{2}-?\w+|\d+-\d+)
                     '''
@@ -43,9 +40,6 @@ class ServusIE(InfoExtractor):
     }, {
         # URL schema v4
         'url': 'https://www.servustv.com/de/page/AA-28BYCQNH92111/vie-ferrate-klettersteige-in-den-alpen',
-        'only_matching': True,
-    }, {
-        'url': 'https://www.servustv.com/de/embed/AA-28BYCQNH92111',
         'only_matching': True,
     }, {
         'url': 'https://www.servustv.com/natur/v/aa-1xg5xwmgw2112/',
@@ -79,26 +73,12 @@ class ServusIE(InfoExtractor):
         video_id = self._match_id(url).upper()
 
         webpage = self._download_webpage(url, video_id)
-        nextjs_data = self._search_nextjs_v13_data(webpage, video_id, fatal=False)
-        session = traverse_obj(nextjs_data, (..., 'session', {dict}, any)) or {}
-        card = traverse_obj(nextjs_data, (
+        card = traverse_obj(self._search_nextjs_v13_data(webpage, video_id, fatal=False), (
             ..., 'featuredCollectionCards', lambda _, v: v['id'] == video_id, any)) or {}
 
-        try:
-            video = self._download_json(
-                'https://play.redbull.com/init/v1/stv/{}/{}/{}/{}/{}'.format(
-                    session.get('locale') or 'de', session.get('country_code') or 'at',
-                    session.get('category') or 'personal_computer', session.get('os_family') or 'http',
-                    video_id),
-                video_id, 'Downloading video JSON', query=filter_dict({
-                    'device_group': session.get('device_group'),
-                }))
-        except ExtractorError as e:
-            if isinstance(e.cause, HTTPError) and e.cause.status == 404:
-                raise ExtractorError(
-                    e.cause.response.read().decode(errors='replace') or 'Video not found', expected=True)
-            raise
-
+        video = self._download_json(
+            f'https://play.redbull.com/init/v1/stv/de/at/personal_computer/http/{video_id}',
+            video_id, 'Downloading video JSON')
         formats, subtitles = self._extract_m3u8_formats_and_subtitles(
             video['manifest_url'], video_id, 'mp4', m3u8_id='hls')
 
